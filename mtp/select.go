@@ -1,9 +1,18 @@
 package mtp
 
+/*
+#include "imagecapture_bridge.h"
+*/
+import "C"
+
 import (
+	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"regexp"
 	"strings"
+	"unsafe"
 
 	"github.com/ganeshrvel/usb"
 )
@@ -70,6 +79,22 @@ func FindDevices(c *usb.Context) ([]*Device, error) {
 	return cands, nil
 }
 
+// imageCaptureDevices finds cameras through IOKit without claiming USB.
+func imageCaptureDevices() ([]imageCaptureTarget, error) {
+	var message *C.char
+	data := C.omtp_ic_devices(&message)
+	defer C.free(unsafe.Pointer(data))
+	if err := imageCaptureNativeError(message); err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
+	}
+	var targets []imageCaptureTarget
+	err := json.Unmarshal([]byte(C.GoString(data)), &targets)
+	return targets, err
+}
+
 // selectDevice finds a device that matches given pattern
 func selectDevice(cands []*Device, pattern string) (*Device, error) {
 	re, err := regexp.Compile(pattern)
@@ -133,23 +158,29 @@ func selectDevice(cands []*Device, pattern string) (*Device, error) {
 	return found[0], nil
 }
 
-// SelectDevice returns opened MTP device that matches the given pattern.
+// SelectDevice opens a matching MTP device, using ImageCaptureCore if Apple owns USB.
+// GOMTPFS_FORCE_IMAGECAPTURE=1 forces the proxy. See RunMainLoop for CLI use.
 func SelectDevice(pattern string) (*Device, error) {
-	c := usb.NewContext()
-
-	devs, err := FindDevices(c)
-	if err != nil {
-		return nil, err
-	}
-	if len(devs) == 0 {
-		return nil, fmt.Errorf("no MTP devices found")
-	}
-
-	return selectDevice(devs, pattern)
+	return SelectDeviceWithDebugging(pattern, false)
 }
 
-// SelectDeviceForDebugging returns opened MTP device that matches the given pattern and debug information are set true
+// SelectDeviceWithDebugging is SelectDevice with optional diagnostics.
 func SelectDeviceWithDebugging(pattern string, allowDebugging bool) (*Device, error) {
+	if d, err := selectImageCaptureDevice(pattern, allowDebugging); d != nil || err != nil {
+		return d, err
+	}
+	d, err := selectUSBDevice(pattern, allowDebugging)
+	if err == nil {
+		return d, nil
+	}
+	// Apple may have claimed the interface during USB discovery.
+	if d, sharedErr := selectImageCaptureDevice(pattern, allowDebugging); d != nil || sharedErr != nil {
+		return d, sharedErr
+	}
+	return nil, err
+}
+
+func selectUSBDevice(pattern string, allowDebugging bool) (selected *Device, err error) {
 	c := usb.NewContext()
 
 	devs, err := FindDevices(c)
@@ -159,6 +190,14 @@ func SelectDeviceWithDebugging(pattern string, allowDebugging bool) (*Device, er
 	if len(devs) == 0 {
 		return nil, fmt.Errorf("no MTP devices found")
 	}
+	defer func() {
+		for _, d := range devs {
+			if d != selected {
+				d.Close()
+				d.Done()
+			}
+		}
+	}()
 
 	if allowDebugging {
 		for _, _dev := range devs {
@@ -169,4 +208,67 @@ func SelectDeviceWithDebugging(pattern string, allowDebugging bool) (*Device, er
 	}
 
 	return selectDevice(devs, pattern)
+}
+
+func imageCaptureMatchingTarget(targets []imageCaptureTarget, pattern string, force bool) (*imageCaptureTarget, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	var selected *imageCaptureTarget
+	matches := 0
+	for i := range targets {
+		id := strings.Join([]string{targets[i].Manufacturer, targets[i].Name, targets[i].Serial}, " ")
+		if !re.MatchString(id) {
+			continue
+		}
+		matches++
+		if force || targets[i].AppleOwned {
+			selected = &targets[i]
+		}
+	}
+	if selected != nil && matches > 1 {
+		return nil, fmt.Errorf("mtp: more than 1 device; connect one phone at a time")
+	}
+	if selected == nil && force {
+		return nil, fmt.Errorf("imagecapture: no matching MTP camera interface found")
+	}
+	return selected, nil
+}
+
+func selectImageCaptureDevice(pattern string, debug bool) (*Device, error) {
+	targets, err := imageCaptureDevices()
+	if err != nil {
+		return nil, err
+	}
+	force := os.Getenv("GOMTPFS_FORCE_IMAGECAPTURE") == "1"
+	target, err := imageCaptureMatchingTarget(targets, pattern, force)
+	if err != nil || target == nil {
+		return nil, err
+	}
+	device := &Device{proxy: &ptpProxy{
+		target: target,
+		info: UsbDeviceInfo{
+			IdVendor: target.Vendor, IdProduct: target.Product, Device: target.Release,
+			Manufacturer: target.Manufacturer, Product: target.Name, SerialNumber: target.Serial,
+		},
+	}, MTPDebug: debug}
+	if err := device.Open(); err != nil {
+		return nil, err
+	}
+	if force {
+		log.Printf("MTP transport: ImageCaptureCore (forced)")
+	}
+	return device, nil
+}
+
+type imageCaptureTarget struct {
+	Vendor       uint16 `json:"vendor"`
+	Product      uint16 `json:"product"`
+	Location     uint32 `json:"location"`
+	Release      uint16 `json:"release"`
+	Manufacturer string `json:"manufacturer"`
+	Name         string `json:"name"`
+	Serial       string `json:"serial"`
+	AppleOwned   bool   `json:"appleOwned"`
 }

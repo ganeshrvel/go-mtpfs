@@ -1,5 +1,12 @@
 package mtp
 
+/*
+#cgo darwin CFLAGS: -x objective-c -fobjc-arc -fblocks -Wno-deprecated-declarations
+#cgo darwin LDFLAGS: -framework Foundation -framework ImageCaptureCore -framework IOKit
+#include "imagecapture_bridge.h"
+*/
+import "C"
+
 import (
 	"bytes"
 	"encoding/binary"
@@ -7,14 +14,18 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/ganeshrvel/usb"
 )
 
-// An MTP device.
+// An MTP device. Serialize operations, including SendObjectInfo/SendObject pairs.
 type Device struct {
+	proxy *ptpProxy
+
 	h   *usb.DeviceHandle
 	dev *usb.Device
 
@@ -45,6 +56,38 @@ type Device struct {
 
 	session *sessionData
 }
+
+type ptpCommand interface {
+	command(command, out []byte) (data, response []byte, err error)
+	close() error
+}
+
+type ptpProxy struct {
+	target  *imageCaptureTarget // consumed by Open
+	wire    ptpCommand          // nil when closed
+	info    UsbDeviceInfo
+	ops     map[uint16]bool
+	pending *pendingUpload
+}
+
+type pendingUpload struct {
+	handle uint32
+	size   uint32
+}
+
+type imageCaptureNativeWire struct{ handle unsafe.Pointer }
+
+func imageCaptureNativeError(message *C.char) error {
+	if message == nil {
+		return nil
+	}
+	defer C.free(unsafe.Pointer(message))
+	return fmt.Errorf("imagecapture: %s", C.GoString(message))
+}
+
+// Bound memory use for ImageCaptureCore's buffered transfers.
+const proxyChunkSize = 8 * 1024 * 1024
+const proxyMaxPayload = 16 * 1024 * 1024
 
 type UsbDeviceInfo struct {
 	// USB-IF vendor ID.
@@ -91,8 +134,18 @@ func EmptyProgressFunc(_ int64) error {
 	return nil
 }
 
-// Close releases the interface, and closes the device.
+// Close releases this client's connection.
 func (d *Device) Close() error {
+	if d.proxy != nil {
+		d.proxy.target = nil
+		if d.proxy.wire == nil {
+			return nil
+		}
+		wire := d.proxy.wire
+		d.proxy.wire, d.proxy.pending = nil, nil
+		// Close only the framework client; the daemon retains its USB session.
+		return wire.close()
+	}
 	if d.h == nil {
 		return nil // or error?
 	}
@@ -125,10 +178,21 @@ func (d *Device) Close() error {
 	return err
 }
 
+func (w *imageCaptureNativeWire) close() error {
+	if w.handle == nil {
+		return nil
+	}
+	err := imageCaptureNativeError(C.omtp_ic_close(w.handle))
+	w.handle = nil
+	return err
+}
+
 // Done releases the libusb device reference.
 func (d *Device) Done() {
-	d.dev.Unref()
-	d.dev = nil
+	if d.dev != nil {
+		d.dev.Unref()
+		d.dev = nil
+	}
 }
 
 // Claims the USB interface of the device.
@@ -150,6 +214,37 @@ func (d *Device) claim() error {
 
 // Open opens an MTP device.
 func (d *Device) Open() error {
+	if d.proxy != nil {
+		target := d.proxy.target
+		if target == nil {
+			return fmt.Errorf("mtp: externally managed transport cannot be reopened")
+		}
+		d.proxy.target = nil
+		// Open a framework client session; the daemon owns the USB session.
+		var message *C.char
+		handle := C.omtp_ic_open(C.uint32_t(target.Vendor), C.uint32_t(target.Product), C.uint32_t(target.Location), &message)
+		if err := imageCaptureNativeError(message); err != nil {
+			return err
+		}
+		if handle == nil {
+			return fmt.Errorf("imagecapture: missing session")
+		}
+		d.proxy.wire = &imageCaptureNativeWire{handle: handle}
+		var info DeviceInfo
+		if err := d.GetDeviceInfo(&info); err != nil {
+			d.Close()
+			return fmt.Errorf("imagecapture: querying phone: %v", err)
+		}
+		d.proxy.ops = make(map[uint16]bool)
+		for _, op := range info.OperationsSupported {
+			d.proxy.ops[op] = true
+		}
+		if !d.proxy.ops[OC_MTP_GetObjectPropsSupported] || (info.MTPVendorExtensionID != 6 && info.MTPExtension == "") {
+			d.Close()
+			return fmt.Errorf("imagecapture: device does not advertise MTP; select USB File transfer")
+		}
+		return nil
+	}
 	if d.Timeout == 0 {
 		d.Timeout = 2000
 	}
@@ -167,7 +262,10 @@ func (d *Device) Open() error {
 		return err
 	}
 
-	d.claim()
+	if err := d.claim(); err != nil {
+		d.Close()
+		return err
+	}
 
 	if d.ifaceDescr.InterfaceStringIndex == 0 {
 		// Some devices have no interface field, so we'll hardcode ones
@@ -204,6 +302,13 @@ func (d *Device) Open() error {
 
 // ID is the manufacturer + product + serial
 func (d *Device) ID() (string, error) {
+	if d.proxy != nil {
+		info, err := d.GetUsbInfo()
+		if err != nil {
+			return "", err
+		}
+		return strings.Join([]string{info.Manufacturer, info.Product, info.SerialNumber}, " "), nil
+	}
 	if d.h == nil {
 		return "", fmt.Errorf("mtp: ID: device not open")
 	}
@@ -236,6 +341,13 @@ func (d *Device) ID() (string, error) {
 }
 
 func (d *Device) GetUsbInfo() (*UsbDeviceInfo, error) {
+	if d.proxy != nil {
+		if d.proxy.wire == nil {
+			return nil, fmt.Errorf("mtp: device is not open")
+		}
+		info := d.proxy.info
+		return &info, nil
+	}
 	if d.h == nil {
 		return nil, fmt.Errorf("mtp: ID: device not open")
 	}
@@ -288,7 +400,10 @@ func (d *Device) GetUsbInfo() (*UsbDeviceInfo, error) {
 	return &ui, nil
 }
 
-func (d *Device) sendReq(req *Container) error {
+func (req *Container) commandBytes() ([]byte, error) {
+	if len(req.Param) > 5 {
+		return nil, fmt.Errorf("mtp: PTP command has more than five parameters")
+	}
 	c := usbBulkContainer{
 		usbBulkHeader: usbBulkHeader{
 			Length:        uint32(usbHdrLen + 4*len(req.Param)),
@@ -306,11 +421,20 @@ func (d *Device) sendReq(req *Container) error {
 
 	binary.Write(buf, binary.LittleEndian, c.usbBulkHeader)
 	if err := binary.Write(buf, binary.LittleEndian, c.Param[:len(req.Param)]); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (d *Device) sendReq(req *Container) error {
+	data, err := req.commandBytes()
+	if err != nil {
 		return err
 	}
 
-	d.dataPrint(d.sendEP, buf.Bytes())
-	_, err := d.h.BulkTransfer(d.sendEP, buf.Bytes(), d.Timeout)
+	d.dataPrint(d.sendEP, data)
+	_, err = d.h.BulkTransfer(d.sendEP, data, d.Timeout)
 	if err != nil {
 		return err
 	}
@@ -378,9 +502,27 @@ func (s SyncError) Error() string {
 // closing the connection. Such errors include: invalid transaction
 // IDs, USB errors (BUSY, IO, ACCESS etc.), and receiving data for
 // operations that expect no data.
+//
+// Use GetObject/SendObject for chunked proxy transfers.
 func (d *Device) RunTransaction(req *Container, rep *Container,
 	dest io.Writer, src io.Reader, writeSize int64, progressCb ProgressFunc) error {
-	if d.h == nil {
+	if d.proxy != nil {
+		if src != nil && dest != nil || writeSize < 0 {
+			return fmt.Errorf("mtp: invalid data direction or length")
+		}
+		if progressCb == nil {
+			progressCb = EmptyProgressFunc
+		}
+		if d.proxy.wire == nil {
+			return fmt.Errorf("mtp: device is not open")
+		}
+		if req.Code == OC_OpenSession || req.Code == OC_CloseSession || req.Code == OC_ResetDevice {
+			return fmt.Errorf("mtp: proxy manages the physical device session")
+		}
+		if d.proxy.pending != nil && req.Code != OC_SendObject {
+			return fmt.Errorf("mtp: SendObject must immediately follow SendObjectInfo")
+		}
+	} else if d.h == nil {
 		return fmt.Errorf("mtp: cannot run operation %v, device is not open",
 			OC_names[int(req.Code)])
 	}
@@ -396,6 +538,20 @@ func (d *Device) RunTransaction(req *Container, rep *Container,
 	return nil
 }
 
+func (w *imageCaptureNativeWire) command(command, out []byte) ([]byte, []byte, error) {
+	var payload unsafe.Pointer
+	if len(out) > 0 {
+		payload = unsafe.Pointer(&out[0])
+	}
+	r := C.omtp_ic_command(w.handle, unsafe.Pointer(&command[0]), C.size_t(len(command)), payload, C.size_t(len(out)))
+	defer C.free(r.data)
+	defer C.free(r.response)
+	if err := imageCaptureNativeError(r.error); err != nil {
+		return nil, nil, err
+	}
+	return C.GoBytes(r.data, C.int(r.data_size)), C.GoBytes(r.response, C.int(r.response_size)), nil
+}
+
 // runTransaction is like RunTransaction, but without sanity checking
 // before and after the call.
 func (d *Device) runTransaction(req *Container, rep *Container,
@@ -409,6 +565,56 @@ func (d *Device) runTransaction(req *Container, rep *Container,
 
 	if d.MTPDebug {
 		log.Printf("MTP request %s %v\n", OC_names[int(req.Code)], req.Param)
+	}
+
+	if d.proxy != nil {
+		// One proxy call replaces sendReq, bulkWrite, and bulkRead/fetchPacket.
+		command, err := req.commandBytes()
+		if err != nil {
+			return err
+		}
+		var out []byte
+		if src != nil {
+			if writeSize == 0 || writeSize > proxyMaxPayload {
+				return fmt.Errorf("mtp: proxy data-out payload must contain 1..%d bytes", proxyMaxPayload)
+			}
+			out = make([]byte, int(writeSize))
+			if _, err := io.ReadFull(src, out); err != nil {
+				return err
+			}
+		}
+		data, response, err := d.proxy.wire.command(command, out)
+		if err != nil {
+			return SyncError(fmt.Sprintf("mtp: proxy command 0x%04x: %v", req.Code, err))
+		}
+		var h usbBulkHeader
+		if err := binary.Read(bytes.NewReader(response), byteOrder, &h); err != nil ||
+			int(h.Length) != len(response) || h.Length > usbBulkLen || (h.Length-usbHdrLen)%4 != 0 ||
+			!((h.Code >= 0x2000 && h.Code < 0x3000) || (h.Code >= 0xa000 && h.Code < 0xb000)) {
+			return SyncError(fmt.Sprintf("mtp: missing or malformed PTP response for command 0x%04x", req.Code))
+		}
+		*rep = Container{}
+		err = d.decodeRep(&h, response[usbHdrLen:], rep)
+		if d.MTPDebug {
+			log.Printf("MTP response %s %v", getName(RC_names, int(rep.Code)), rep.Param)
+		}
+		if err != nil {
+			return err
+		}
+		if len(data) > proxyMaxPayload || (dest == nil && len(data) != 0) {
+			return SyncError(fmt.Sprintf("mtp: unexpected PTP payload (%d bytes) for command 0x%04x", len(data), req.Code))
+		}
+		if dest != nil {
+			if _, err := io.Copy(dest, bytes.NewReader(data)); err != nil {
+				return err
+			}
+			return progressCb(int64(len(data)))
+		}
+		if src != nil {
+			return progressCb(writeSize)
+		}
+		// The daemon assigns transaction IDs.
+		return nil
 	}
 
 	if err := d.sendReq(req); err != nil {
@@ -656,9 +862,11 @@ func (d *Device) bulkRead(w io.Writer, progressCb ProgressFunc) (n int64, lastPa
 	return n, buf[:0], err
 }
 
-// Configure is a robust version of OpenSession. On failure, it resets
-// the device and reopens the device and the session.
+// Configure prepares an MTP session, resetting failed libusb connections.
 func (d *Device) Configure() error {
+	if d.proxy != nil {
+		return d.OpenSession()
+	}
 	if d.h == nil {
 		if err := d.Open(); err != nil {
 			return err
@@ -690,4 +898,21 @@ func (d *Device) Configure() error {
 		}
 	}
 	return nil
+}
+
+// RunMainLoop runs fn on a worker and macOS callbacks on the main thread.
+// Call from main after runtime.LockOSThread in init. Other platforms call fn directly.
+func RunMainLoop(fn func()) {
+	if runtime.GOOS != "darwin" {
+		fn()
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer C.omtp_ic_stop_loop()
+		fn()
+	}()
+	C.omtp_ic_run_loop()
+	<-done
 }

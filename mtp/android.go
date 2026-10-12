@@ -1,6 +1,7 @@
 package mtp
 
 import (
+	"fmt"
 	"io"
 )
 
@@ -37,6 +38,12 @@ func (d *Device) AndroidGetPartialObject64(handle uint32, w io.Writer, offset in
 	return d.RunTransaction(&req, &rep, w, nil, 0, EmptyProgressFunc)
 }
 
+func (d *Device) canEditObjects() bool {
+	ops := d.proxy.ops
+	return ops[OC_ANDROID_BEGIN_EDIT_OBJECT] && ops[OC_ANDROID_SEND_PARTIAL_OBJECT] &&
+		ops[OC_ANDROID_TRUNCATE_OBJECT] && ops[OC_ANDROID_END_EDIT_OBJECT]
+}
+
 // AndroidBeginEditObject opens a file for writing.
 func (d *Device) AndroidBeginEditObject(handle uint32) error {
 	var req, rep Container
@@ -68,6 +75,12 @@ func (d *Device) AndroidSendPartialObject(handle uint32, offset int64, size uint
 	d.SeparateHeader = true
 	err := d.RunTransaction(&req, &rep, nil, r, int64(size), EmptyProgressFunc)
 	d.SeparateHeader = false
+	// Android may omit header-packet bytes from this count.
+	// SendObject verifies the final size; do not replay a short count.
+	if d.proxy != nil && err == nil && (len(rep.Param) != 1 || rep.Param[0] > size) {
+		d.Close()
+		return fmt.Errorf("mtp: invalid partial-object write count")
+	}
 	return err
 }
 

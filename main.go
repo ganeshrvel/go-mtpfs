@@ -8,6 +8,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -18,7 +19,15 @@ import (
 	"github.com/ganeshrvel/go-mtpfs/mtp"
 )
 
-func main() {
+func init() {
+	if runtime.GOOS == "darwin" {
+		runtime.LockOSThread()
+	}
+}
+
+func main() { mtp.RunMainLoop(run) }
+
+func run() {
 	debug := flag.String("debug", "", "comma-separated list of debugging options: usb, data, mtp, fuse")
 	usbTimeout := flag.Int("usb-timeout", 5000, "timeout in milliseconds")
 	vfat := flag.Bool("vfat", true, "assume removable RAM media uses VFAT, and rewrite names.")

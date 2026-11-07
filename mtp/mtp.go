@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ganeshrvel/usb"
@@ -44,6 +45,10 @@ type Device struct {
 	SeparateHeader bool
 
 	session *sessionData
+
+	// MTP allows one transaction at a time; this lets goroutines share the device
+	// (e.g. listing directories while a download is in flight).
+	txMu sync.Mutex
 }
 
 type UsbDeviceInfo struct {
@@ -380,6 +385,9 @@ func (s SyncError) Error() string {
 // operations that expect no data.
 func (d *Device) RunTransaction(req *Container, rep *Container,
 	dest io.Writer, src io.Reader, writeSize int64, progressCb ProgressFunc) error {
+	d.txMu.Lock()
+	defer d.txMu.Unlock()
+
 	if d.h == nil {
 		return fmt.Errorf("mtp: cannot run operation %v, device is not open",
 			OC_names[int(req.Code)])

@@ -206,25 +206,33 @@ func decodeTime(r io.Reader, f reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	var t time.Time
-	if s != "" {
-		// Samsung has trailing dots.
-		s = strings.TrimRight(s, ".")
-
-		// Jolla Sailfish has trailing "Z".
-		s = strings.TrimRight(s, "Z")
-
-		t, err = time.Parse(timeFormat, s)
-		if err != nil {
-			// Nokia lumia has numTZ
-			t, err = time.Parse(timeFormatNumTZ, s)
-			if err != nil {
-				return err
-			}
-		}
+	t, err := ParseTime(s)
+	if err != nil {
+		return err
 	}
 	f.Set(reflect.ValueOf(t))
 	return nil
+}
+
+// ParseTime parses an MTP DateTime string, as found in ObjectInfo or in DateModified/DateCreated properties.
+// An empty string yields the zero time.
+func ParseTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+
+	// Samsung has trailing dots.
+	s = strings.TrimRight(s, ".")
+
+	// Jolla Sailfish has trailing "Z".
+	s = strings.TrimRight(s, "Z")
+
+	t, err := time.Parse(timeFormat, s)
+	if err != nil {
+		// Nokia lumia has numTZ
+		return time.Parse(timeFormatNumTZ, s)
+	}
+	return t, nil
 }
 
 func decodeField(r io.Reader, f reflect.Value, typeSelector DataTypeSelector) error {
